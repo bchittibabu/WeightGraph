@@ -11,10 +11,15 @@ struct WeightChart<Model: WeightGraphModeling>: View {
     @ObservedObject var model: Model
     @State private var currentSpan: Span = .week
     @State private var shouldScrollToLatest = false
-    @State private var isScrolling = false
-    @State private var scrollPosition: Date?
     @State private var visibleDataPoints: [Bin] = []
     @State private var visibleBMIPoints: [Bin] = []
+    @State private var isScrolling = false
+    @State private var scrollEndTimer: Timer?
+    @State private var hasDetectedScrollInCurrentGesture = false
+    @State private var selectedPoint: Bin?
+    @State private var showCrosshair = false
+    @State private var currentScrollPosition: Date?
+    @State private var selectedXValue: Date?
 
     var body: some View {
         VStack(alignment: .leading) {
@@ -25,15 +30,22 @@ struct WeightChart<Model: WeightGraphModeling>: View {
         .onAppear { 
             model.onAppear()
             updateVisibleData()
+            // Initialize scroll position to latest data
+            currentScrollPosition = model.bins.last?.date ?? Date()
         }
         .onChange(of: model.bins) { _, _ in
             updateVisibleData()
+            // Update scroll position if it's not set or if new data is available
+            if currentScrollPosition == nil || (model.bins.last?.date ?? Date()) > (currentScrollPosition ?? Date()) {
+                currentScrollPosition = model.bins.last?.date ?? Date()
+            }
         }
         .onChange(of: model.bmiBins) { _, _ in
             updateVisibleData()
         }
         .onChange(of: model.span) { _, _ in
-            updateVisibleData()
+            os_log("Span changed - updating visible data", log: perfLog, type: .info)
+            updateVisibleDataAfterScroll()
         }
     }
 
@@ -100,6 +112,27 @@ struct WeightChart<Model: WeightGraphModeling>: View {
             if model.showBMI {
                 bmiChartContent
             }
+            
+            // Add crosshair elements directly here
+            if let selectedPoint = selectedPoint, showCrosshair {
+                // Highlighted point
+                PointMark(
+                    x: .value("Date", selectedPoint.date),
+                    y: .value("Weight", selectedPoint.value)
+                )
+                .foregroundStyle(.primary)
+                .symbolSize(80)
+                
+                // Dotted vertical line
+                RuleMark(
+                    x: .value("Date", selectedPoint.date)
+                )
+                .foregroundStyle(.secondary)
+                .lineStyle(StrokeStyle(lineWidth: 2, dash: [5, 5]))
+                .annotation(position: .top, alignment: .center) {
+                    crosshairAnnotation(for: selectedPoint)
+                }
+            }
         }
         .chartForegroundStyleScale([
             "Weight": .blue,
@@ -109,14 +142,51 @@ struct WeightChart<Model: WeightGraphModeling>: View {
         .chartScrollTargetBehavior(.paging)
         .chartXVisibleDomain(length: visibleLength)
         .chartYScale(domain: yDomain)
-        .chartScrollPosition(initialX: model.bins.first?.date ?? Date())
-        .chartScrollPosition(x: .constant(scrollPosition ?? Date()))
+        .chartScrollPosition(x: Binding(
+            get: { currentScrollPosition ?? model.bins.last?.date ?? Date() },
+            set: { newValue in
+                currentScrollPosition = newValue
+                os_log("Scroll position updated to: %@", log: perfLog, type: .info, newValue.description)
+            }
+        ))
+        .chartXSelection(value: Binding(
+            get: { selectedXValue },
+            set: { newValue in
+                selectedXValue = newValue
+                if let selectedDate = newValue {
+                    handleChartSelection(at: selectedDate)
+                }
+            }
+        ))
         .frame(height: 240)
         .frame(maxWidth: .infinity)
         .accessibilityLabel(Text("Weight chart"))
-        .onScrollPhaseChange { oldPhase, newPhase in
-            handleScrollPhaseChange(oldPhase: oldPhase, newPhase: newPhase)
-        }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 3)
+                .onChanged { value in
+                    // Only detect horizontal scrolling gestures
+                    let isHorizontalScroll = abs(value.translation.width) > abs(value.translation.height) * 1.5
+                    let isSignificantMovement = abs(value.translation.width) > 8
+                    
+                    if isHorizontalScroll && isSignificantMovement && !hasDetectedScrollInCurrentGesture {
+                        hasDetectedScrollInCurrentGesture = true
+                        handleScrollStart()
+                    }
+                }
+                .onEnded { value in
+                    // Reset for next gesture
+                    hasDetectedScrollInCurrentGesture = false
+                    
+                    // Only handle if it was a horizontal scroll
+                    let isHorizontalScroll = abs(value.translation.width) > abs(value.translation.height) * 1.5
+                    let isSignificantMovement = abs(value.translation.width) > 8
+                    
+                    if isHorizontalScroll && isSignificantMovement {
+                        handleScrollEnd()
+                    }
+                }
+        )
+
     }
     
     @ChartContentBuilder
@@ -124,6 +194,14 @@ struct WeightChart<Model: WeightGraphModeling>: View {
         let weightSegments = getConnectedSegments(from: visibleDataPoints)
         ForEach(Array(weightSegments.enumerated()), id: \.offset) { segmentIndex, segment in
             ForEach(segment) { bin in
+                // Invisible larger tap target
+                PointMark(
+                    x: .value("Date", bin.date),
+                    y: .value("Weight", bin.value)
+                )
+                .symbolSize(200)
+                .foregroundStyle(.clear)
+                
                 LineMark(
                     x: .value("Date", bin.date),
                     y: .value("Weight", bin.value),
@@ -147,6 +225,14 @@ struct WeightChart<Model: WeightGraphModeling>: View {
         let bmiSegments = getConnectedSegments(from: visibleBMIPoints)
         ForEach(Array(bmiSegments.enumerated()), id: \.offset) { segmentIndex, segment in
             ForEach(segment) { bin in
+                // Invisible larger tap target
+                PointMark(
+                    x: .value("Date", bin.date),
+                    y: .value("BMI", bin.value)
+                )
+                .symbolSize(200)
+                .foregroundStyle(.clear)
+                
                 LineMark(
                     x: .value("Date", bin.date),
                     y: .value("BMI", bin.value),
@@ -163,6 +249,29 @@ struct WeightChart<Model: WeightGraphModeling>: View {
                 .foregroundStyle(.green)
             }
         }
+    }
+    
+    @ViewBuilder
+    private func crosshairAnnotation(for point: Bin) -> some View {
+        VStack(spacing: 2) {
+            Text(formatDate(point.date))
+                .font(.caption2)
+                .foregroundColor(.blue)
+            Text("\(point.value, specifier: "%.1f") \(model.unit.symbol)")
+                .font(.caption.bold())
+                .foregroundColor(.blue)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.white)
+                .shadow(color: .black.opacity(0.2), radius: 4, x: 0, y: 2)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.blue.opacity(0.3), lineWidth: 1)
+        )
     }
     
     // MARK: - Smart Line Connection Logic
@@ -216,31 +325,8 @@ struct WeightChart<Model: WeightGraphModeling>: View {
     
     // MARK: - Post-Scroll Calculations
     
-    private func handleScrollPhaseChange(oldPhase: ScrollPhase, newPhase: ScrollPhase) {
-        switch newPhase {
-        case .idle:
-            // Scrolling stopped - perform calculations
-            if isScrolling {
-                isScrolling = false
-                os_log("Scroll ended - updating visible data", log: perfLog, type: .info)
-                updateVisibleDataAfterScroll()
-            }
-        case .tracking, .interacting:
-            // Scrolling started
-            if !isScrolling {
-                isScrolling = true
-                os_log("Scroll started", log: perfLog, type: .info)
-            }
-        case .decelerating, .animating:
-            // Still scrolling but decelerating or animating
-            break
-        @unknown default:
-            break
-        }
-    }
-    
     private func updateVisibleData() {
-        // Update visible data points based on current scroll position
+        // Update visible data points based on current data
         visibleDataPoints = model.bins
         visibleBMIPoints = model.bmiBins.compactMap { bin in
             let bmiValues = model.bmiBins.map { $0.value }
@@ -257,13 +343,6 @@ struct WeightChart<Model: WeightGraphModeling>: View {
             guard normalizedValue >= weightMin && normalizedValue <= weightMax else { return nil }
             
             return Bin(date: bin.date, value: normalizedValue)
-        }
-    }
-    
-    private func updateVisibleDataAfterScroll() {
-        // Perform expensive calculations only after scrolling stops
-        DispatchQueue.main.async {
-            updateVisibleData()
         }
     }
 
@@ -294,6 +373,77 @@ struct WeightChart<Model: WeightGraphModeling>: View {
         let startVal = slope * firstDate.timeIntervalSince1970 + intercept
         let endVal = slope * lastDate.timeIntervalSince1970 + intercept
         return (firstDate, startVal, lastDate, endVal)
+    }
+
+    private func handleScrollStart() {
+        // Cancel any existing timer
+        scrollEndTimer?.invalidate()
+        
+        if !isScrolling {
+            isScrolling = true
+            os_log("Scroll started", log: perfLog, type: .info)
+        }
+    }
+    
+    private func handleScrollEnd() {
+        // Cancel any existing timer
+        scrollEndTimer?.invalidate()
+        
+        // Set a timer to detect when scrolling has truly ended
+        scrollEndTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: false) { _ in
+            self.isScrolling = false
+            self.showCrosshair = false
+            self.selectedXValue = nil  // Clear selection state
+            os_log("Scroll ended", log: perfLog, type: .info)
+            self.updateVisibleDataAfterScroll()
+        }
+    }
+    
+    private func updateVisibleDataAfterScroll() {
+        // Post-scroll Y-domain and BMI normalization updates
+        DispatchQueue.main.async {
+            self.updateVisibleData()
+        }
+    }
+
+    private func handleChartSelection(at selectedDate: Date) {
+        // Only handle selection if not currently scrolling
+        guard !isScrolling else { return }
+        
+        // Hide any existing crosshair first
+        showCrosshair = false
+        
+        guard !model.bins.isEmpty else { return }
+        
+        // Find the closest data point to the selected date
+        let selectedBin = model.bins.min { bin1, bin2 in
+            abs(bin1.date.timeIntervalSince(selectedDate)) < abs(bin2.date.timeIntervalSince(selectedDate))
+        }
+        
+        guard let selectedBin = selectedBin else { return }
+        
+        // Set the selected point and show crosshair
+        selectedPoint = selectedBin
+        
+        // Force UI update
+        DispatchQueue.main.async {
+            self.showCrosshair = true
+            os_log("Crosshair should be visible: %@ = %.1f %@, showCrosshair: %@", log: perfLog, type: .info, 
+                   self.formatDate(selectedBin.date), selectedBin.value, self.model.unit.symbol, String(self.showCrosshair))
+        }
+    }
+    
+    private func formatDate(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        switch model.span {
+        case .week:
+            formatter.dateFormat = "MMM d"
+        case .month:
+            formatter.dateFormat = "MMM d"
+        case .year:
+            formatter.dateFormat = "MMM yyyy"
+        }
+        return formatter.string(from: date)
     }
 }
 

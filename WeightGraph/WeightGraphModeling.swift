@@ -9,5 +9,6 @@ public protocol WeightGraphModeling: ObservableObject {
     var bins: [Bin] { get }
     var bmiBins: [Bin] { get }
     var showBMI: Bool { get set }
+    var unit: WeightUnit { get set }
     func onAppear()
 } 

@@ -88,7 +88,8 @@ public final class WeightGraphModel: ObservableObject, WeightGraphModeling {
         let signpostID = OSSignpostID(log: modelLog)
         os_signpost(.begin, log: modelLog, name: "updateWindow", signpostID: signpostID)
         
-        // Always populate both weight and BMI bins
+        // Always provide full dataset - remove aggressive windowing that limits scrolling
+        // The SwiftUI Charts framework handles performance optimization internally
         if !allWeightBins.isEmpty {
             if unit == .kilogram {
                 bins = allWeightBins
@@ -100,7 +101,6 @@ public final class WeightGraphModel: ObservableObject, WeightGraphModeling {
         }
         
         if !allBMIBins.isEmpty {
-            // BMI is always in kg/m² regardless of weight unit
             bmiBins = allBMIBins
         } else {
             bmiBins = []

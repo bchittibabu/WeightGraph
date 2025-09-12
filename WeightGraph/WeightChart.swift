@@ -43,9 +43,13 @@ struct WeightChart<Model: WeightGraphModeling>: View {
         .onChange(of: model.bmiBins) { _, _ in
             updateVisibleData()
         }
-        .onChange(of: model.span) { _, _ in
-            os_log("Span changed - updating visible data", log: perfLog, type: .info)
-            updateVisibleDataAfterScroll()
+        .onChange(of: model.span) { _, newSpan in
+            os_log("Span changed to %@ - updating visible data", log: perfLog, type: .info, String(describing: newSpan))
+            
+            // Debounce rapid span changes to improve performance
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                self.updateVisibleDataAfterScroll()
+            }
         }
     }
 
@@ -279,28 +283,32 @@ struct WeightChart<Model: WeightGraphModeling>: View {
     private func getConnectedSegments(from dataPoints: [Bin]) -> [[Bin]] {
         guard !dataPoints.isEmpty else { return [] }
         
+        // Use all data points for full scrollable experience
+        let points = dataPoints
+        
         var segments: [[Bin]] = []
         var currentSegment: [Bin] = []
         
-        let sortedPoints = dataPoints.sorted { $0.date < $1.date }
+        // Data should already be sorted from the model, but ensure it
+        let sortedPoints = points.sorted { $0.date < $1.date }
         
-        for (_, point) in sortedPoints.enumerated() {
+        // Define maximum gap based on span (optimized)
+        let maxGap: TimeInterval
+        switch model.span {
+        case .week:
+            maxGap = 3 * 24 * 60 * 60 // 3 days
+        case .month:
+            maxGap = 7 * 24 * 60 * 60 // 1 week
+        case .year:
+            maxGap = 30 * 24 * 60 * 60 // 1 month
+        }
+        
+        for point in sortedPoints {
             if currentSegment.isEmpty {
                 currentSegment.append(point)
             } else {
                 let lastPoint = currentSegment.last!
                 let timeDifference = point.date.timeIntervalSince(lastPoint.date)
-                
-                // Define maximum gap based on span
-                let maxGap: TimeInterval
-                switch model.span {
-                case .week:
-                    maxGap = 7 * 24 * 60 * 60 // 3 days
-                case .month:
-                    maxGap = 30 * 24 * 60 * 60 // 1 week
-                case .year:
-                    maxGap = 30 * 24 * 60 * 60 // 1 month
-                }
                 
                 if timeDifference <= maxGap {
                     // Continue current segment
@@ -326,20 +334,36 @@ struct WeightChart<Model: WeightGraphModeling>: View {
     // MARK: - Post-Scroll Calculations
     
     private func updateVisibleData() {
-        // Update visible data points based on current data
+        // Optimize data processing by avoiding redundant calculations
         visibleDataPoints = model.bins
+        
+        // Cache BMI normalization values to avoid recalculating on every update
+        guard !model.bmiBins.isEmpty && !model.bins.isEmpty else {
+            visibleBMIPoints = []
+            return
+        }
+        
+        let bmiValues = model.bmiBins.map { $0.value }
+        let weightValues = model.bins.map { $0.value }
+        
+        let bmiMin: Double = bmiValues.min() ?? 18
+        let bmiMax: Double = bmiValues.max() ?? 35
+        let weightMin = weightValues.min() ?? 0
+        let weightMax = weightValues.max() ?? 1
+        
+        // Avoid division by zero
+        guard bmiMax > bmiMin, weightMax > weightMin else {
+            visibleBMIPoints = []
+            return
+        }
+        
+        let bmiRange = bmiMax - bmiMin
+        let weightRange = weightMax - weightMin
+        
         visibleBMIPoints = model.bmiBins.compactMap { bin in
-            let bmiValues = model.bmiBins.map { $0.value }
-            let weightValues = model.bins.map { $0.value }
-            
-            let bmiMin: Double = bmiValues.min() ?? 18
-            let bmiMax: Double = bmiValues.max() ?? 35
-            let weightMin = weightValues.min() ?? 0
-            let weightMax = weightValues.max() ?? 1
-            
             guard bin.value >= bmiMin && bin.value <= bmiMax else { return nil }
             
-            let normalizedValue = weightMin + (bin.value - bmiMin) * (weightMax - weightMin) / (bmiMax - bmiMin)
+            let normalizedValue = weightMin + (bin.value - bmiMin) * weightRange / bmiRange
             guard normalizedValue >= weightMin && normalizedValue <= weightMax else { return nil }
             
             return Bin(date: bin.date, value: normalizedValue)
@@ -450,26 +474,56 @@ struct WeightChart<Model: WeightGraphModeling>: View {
 #Preview {
     struct PreviewProviderStore: WeightStatisticsProviding {
         func bins(for span: Span) async throws -> [Bin] {
-            let count: Int = span == .week ? 7 : span == .month ? 30 : 365
+            // Generate more extensive data for preview - up to 10 years
+            let count: Int = span == .week ? 7 : span == .month ? 30 : 3650 // 10 years for year view
+            let startWeight = 75.0
+            
             return (0..<count).compactMap { idx in
-                // Skip some days to create missing data
-                if idx % 5 == 0 || idx % 7 == 0 {
-                    return nil // Missing data
+                let date = Date().addingTimeInterval(Double(-idx) * 86_400)
+                
+                // Skip some days to create realistic missing data
+                if idx % 7 == 0 || (idx % 5 == 0 && idx % 10 != 0) {
+                    return nil // Missing data pattern
                 }
                 
-                return Bin(date: Date().addingTimeInterval(Double(-idx) * 86_400), value: 70 + Double(idx).truncatingRemainder(dividingBy: 5))
+                // Create realistic weight trends for preview
+                let yearsFromStart = Double(idx) / 365.0
+                let agingTrend = yearsFromStart * 0.3 // Slower trend for preview
+                let seasonalVariation = sin((Double(idx % 365) / 365.0) * 2.0 * .pi) * 2.0
+                let dailyVariation = Double.random(in: -1.0...1.0)
+                
+                let weight = startWeight + agingTrend + seasonalVariation + dailyVariation
+                let clampedWeight = max(60.0, min(90.0, weight))
+                
+                return Bin(date: date, value: clampedWeight)
             }.sorted { $0.date < $1.date }
         }
         
         func bmiBins(for span: Span) async throws -> [Bin] {
-            let count: Int = span == .week ? 7 : span == .month ? 30 : 365
+            // Generate correlated BMI data for preview
+            let count: Int = span == .week ? 7 : span == .month ? 30 : 3650 // 10 years for year view
+            let baseHeight = 1.75
+            let startWeight = 75.0
+            
             return (0..<count).compactMap { idx in
-                // Different missing pattern for BMI
-                if idx % 4 == 0 {
+                let date = Date().addingTimeInterval(Double(-idx) * 86_400)
+                
+                // BMI measured less frequently
+                if idx % 3 == 0 || idx % 8 == 0 {
                     return nil // Missing BMI data
                 }
                 
-                return Bin(date: Date().addingTimeInterval(Double(-idx) * 86_400), value: 22 + Double(idx).truncatingRemainder(dividingBy: 3))
+                // Calculate BMI based on weight trends
+                let yearsFromStart = Double(idx) / 365.0
+                let agingTrend = yearsFromStart * 0.3
+                let seasonalVariation = sin((Double(idx % 365) / 365.0) * 2.0 * .pi) * 2.0
+                let dailyVariation = Double.random(in: -0.5...0.5)
+                
+                let weight = startWeight + agingTrend + seasonalVariation + dailyVariation
+                let clampedWeight = max(60.0, min(90.0, weight))
+                let bmi = clampedWeight / (baseHeight * baseHeight)
+                
+                return Bin(date: date, value: bmi)
             }.sorted { $0.date < $1.date }
         }
     }

@@ -9,6 +9,10 @@ public final class WeightStore: ObservableObject {
 
     private let provider: WeightStatisticsProviding
     private var refreshTask: Task<Void, Never>?
+    
+    // Cache control
+    private var lastRefreshDate: Date?
+    private let cacheExpiryInterval: TimeInterval = 300 // 5 minutes
 
     public init(provider: WeightStatisticsProviding) {
         self.provider = provider
@@ -19,11 +23,20 @@ public final class WeightStore: ObservableObject {
     }
 
     /// Refresh the cache for all spans. Existing values remain until new data arrives.
-    public func refresh() {
+    /// Uses caching to avoid unnecessary refreshes.
+    public func refresh(force: Bool = false) {
+        // Check if we need to refresh based on cache expiry
+        if !force, let lastRefresh = lastRefreshDate,
+           Date().timeIntervalSince(lastRefresh) < cacheExpiryInterval,
+           !binsBySpan.isEmpty {
+            return // Cache is still valid
+        }
+        
         refreshTask?.cancel()
         refreshTask = Task { [weak self] in
             guard let self else { return }
-            // Run all span requests concurrently.
+            
+            // Run all span requests concurrently for efficiency
             async let week = provider.bins(for: .week)
             async let month = provider.bins(for: .month)
             async let year = provider.bins(for: .year)
@@ -43,6 +56,8 @@ public final class WeightStore: ObservableObject {
                 self.bmiBinsBySpan[.week] = weekBMIBins
                 self.bmiBinsBySpan[.month] = monthBMIBins
                 self.bmiBinsBySpan[.year] = yearBMIBins
+                
+                self.lastRefreshDate = Date()
             } catch {
                 debugPrint("WeightStore refresh error:", error)
             }

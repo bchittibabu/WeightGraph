@@ -7,7 +7,28 @@ import os
 
 private let perfLog = OSLog(subsystem: Bundle.main.bundleIdentifier ?? "WeightGraph", category: "Scrolling")
 
-struct WeightChart<Model: WeightGraphModeling>: View {
+/// High-Performance WeightChart for Large Datasets (10+ years)
+/// 
+/// Performance Optimizations:
+/// 1. **Progressive Data Loading**: Adaptive windowing with overlapping buffers for continuous scrolling
+/// 2. **Intelligent Caching**: Caches Y-domain and BMI normalization calculations
+/// 3. **Debounced Updates**: Prevents excessive recalculations during rapid changes
+/// 4. **Data Density Adaptation**: Adjusts window size based on local data density
+/// 5. **Smooth Scrolling**: 4x buffer multiplier eliminates stuttering at window boundaries
+/// 6. **Real-time Updates**: Progressive loading triggered by scroll position changes
+/// 
+/// Smooth Scrolling Features:
+/// - **Overlapping Windows**: Prevents data gaps during scroll transitions
+/// - **Adaptive Point Count**: 500-2000 points based on data density and span
+/// - **Responsive Updates**: 20ms debounce for scroll position changes
+/// - **Gesture Sensitivity**: Lower thresholds for better scroll detection
+/// 
+/// Key Changes from Original:
+/// - `model.bins` → `getProgressiveWindowData()` with density-based adaptation
+/// - Real-time scroll position tracking with `updateVisibleDataProgressively()`
+/// - Overlapping 4x buffers instead of discrete 2x windows
+/// - OSSignpost logging for performance monitoring
+public struct WeightChart<Model: WeightGraphModeling>: View {
     @ObservedObject var model: Model
     @State private var currentSpan: Span = .week
     @State private var shouldScrollToLatest = false
@@ -20,8 +41,20 @@ struct WeightChart<Model: WeightGraphModeling>: View {
     @State private var showCrosshair = false
     @State private var currentScrollPosition: Date?
     @State private var selectedXValue: Date?
+    
+    // Performance optimization: Cache calculated values
+    @State private var cachedWeightDomain: ClosedRange<Double>?
+    @State private var cachedBMINormalization: (min: Double, max: Double, weightMin: Double, weightMax: Double)?
+    @State private var lastUpdateTimestamp: Date = Date()
+    
+    // Window size for visible data (performance optimization)
+    private var windowMultiplier: Double = 4.0 // Show 4x the visible span for smoother scrolling
+    
+    public init(model: Model) {
+        self.model = model
+    }
 
-    var body: some View {
+    public var body: some View {
         VStack(alignment: .leading) {
             spanPicker
             chartTypeToggle
@@ -29,26 +62,42 @@ struct WeightChart<Model: WeightGraphModeling>: View {
         }
         .onAppear { 
             model.onAppear()
-            updateVisibleData()
+            updateVisibleDataOptimized()
             // Initialize scroll position to latest data
             currentScrollPosition = model.bins.last?.date ?? Date()
         }
         .onChange(of: model.bins) { _, _ in
-            updateVisibleData()
-            // Update scroll position if it's not set or if new data is available
-            if currentScrollPosition == nil || (model.bins.last?.date ?? Date()) > (currentScrollPosition ?? Date()) {
-                currentScrollPosition = model.bins.last?.date ?? Date()
+            // Debounce updates to avoid excessive recalculations
+            lastUpdateTimestamp = Date()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                if Date().timeIntervalSince(self.lastUpdateTimestamp) >= 0.04 {
+                    self.updateVisibleDataOptimized()
+                    // Update scroll position if it's not set or if new data is available
+                    if self.currentScrollPosition == nil || (self.model.bins.last?.date ?? Date()) > (self.currentScrollPosition ?? Date()) {
+                        self.currentScrollPosition = self.model.bins.last?.date ?? Date()
+                    }
+                }
             }
         }
         .onChange(of: model.bmiBins) { _, _ in
-            updateVisibleData()
+            // Debounce updates to avoid excessive recalculations
+            lastUpdateTimestamp = Date()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                if Date().timeIntervalSince(self.lastUpdateTimestamp) >= 0.04 {
+                    self.updateVisibleDataOptimized()
+                }
+            }
         }
         .onChange(of: model.span) { _, newSpan in
             os_log("Span changed to %@ - updating visible data", log: perfLog, type: .info, String(describing: newSpan))
             
+            // Clear cache when span changes
+            cachedWeightDomain = nil
+            cachedBMINormalization = nil
+            
             // Debounce rapid span changes to improve performance
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                self.updateVisibleDataAfterScroll()
+                self.updateVisibleDataOptimized()
             }
         }
     }
@@ -85,13 +134,8 @@ struct WeightChart<Model: WeightGraphModeling>: View {
     }
 
     private var chartView: some View {
-        let weightValues = model.bins.map { $0.value }
-        
-        // Use only weight values for domain calculation
-        let minY = weightValues.min() ?? 0
-        let maxY = weightValues.max() ?? 1
-        let yPadding = (maxY - minY) * 0.1
-        let yDomain = (minY - yPadding)...(maxY + yPadding)
+        // Use cached domain calculation for performance
+        let yDomain = getOptimizedYDomain()
         
         let visibleLength: TimeInterval
         switch model.span {
@@ -151,6 +195,9 @@ struct WeightChart<Model: WeightGraphModeling>: View {
             set: { newValue in
                 currentScrollPosition = newValue
                 os_log("Scroll position updated to: %@", log: perfLog, type: .info, newValue.description)
+                
+                // Trigger progressive data loading on scroll position change
+                updateVisibleDataProgressively()
             }
         ))
         .chartXSelection(value: Binding(
@@ -166,11 +213,11 @@ struct WeightChart<Model: WeightGraphModeling>: View {
         .frame(maxWidth: .infinity)
         .accessibilityLabel(Text("Weight chart"))
         .simultaneousGesture(
-            DragGesture(minimumDistance: 3)
+            DragGesture(minimumDistance: 2) // More sensitive detection
                 .onChanged { value in
                     // Only detect horizontal scrolling gestures
-                    let isHorizontalScroll = abs(value.translation.width) > abs(value.translation.height) * 1.5
-                    let isSignificantMovement = abs(value.translation.width) > 8
+                    let isHorizontalScroll = abs(value.translation.width) > abs(value.translation.height) * 1.2
+                    let isSignificantMovement = abs(value.translation.width) > 5 // Lower threshold
                     
                     if isHorizontalScroll && isSignificantMovement && !hasDetectedScrollInCurrentGesture {
                         hasDetectedScrollInCurrentGesture = true
@@ -182,8 +229,8 @@ struct WeightChart<Model: WeightGraphModeling>: View {
                     hasDetectedScrollInCurrentGesture = false
                     
                     // Only handle if it was a horizontal scroll
-                    let isHorizontalScroll = abs(value.translation.width) > abs(value.translation.height) * 1.5
-                    let isSignificantMovement = abs(value.translation.width) > 8
+                    let isHorizontalScroll = abs(value.translation.width) > abs(value.translation.height) * 1.2
+                    let isSignificantMovement = abs(value.translation.width) > 5
                     
                     if isHorizontalScroll && isSignificantMovement {
                         handleScrollEnd()
@@ -334,40 +381,67 @@ struct WeightChart<Model: WeightGraphModeling>: View {
     // MARK: - Post-Scroll Calculations
     
     private func updateVisibleData() {
-        // Optimize data processing by avoiding redundant calculations
-        visibleDataPoints = model.bins
+        updateVisibleDataOptimized()
+    }
+    
+    private func updateVisibleDataOptimized() {
+        let signpostID = OSSignpostID(log: perfLog)
+        os_signpost(.begin, log: perfLog, name: "updateVisibleData", signpostID: signpostID)
+        
+        // Performance optimization: Only process windowed data for chart rendering
+        visibleDataPoints = getWindowedData(from: model.bins)
         
         // Cache BMI normalization values to avoid recalculating on every update
         guard !model.bmiBins.isEmpty && !model.bins.isEmpty else {
             visibleBMIPoints = []
+            cachedBMINormalization = nil
+            os_signpost(.end, log: perfLog, name: "updateVisibleData", signpostID: signpostID)
             return
         }
         
-        let bmiValues = model.bmiBins.map { $0.value }
-        let weightValues = model.bins.map { $0.value }
-        
-        let bmiMin: Double = bmiValues.min() ?? 18
-        let bmiMax: Double = bmiValues.max() ?? 35
-        let weightMin = weightValues.min() ?? 0
-        let weightMax = weightValues.max() ?? 1
+        // Use cached normalization if available
+        let normalization: (min: Double, max: Double, weightMin: Double, weightMax: Double)
+        if let cached = cachedBMINormalization {
+            normalization = cached
+        } else {
+            // Only calculate on visible BMI data for performance
+            let visibleBMIData = getWindowedData(from: model.bmiBins)
+            let visibleWeightData = getWindowedData(from: model.bins)
+            
+            let bmiValues = visibleBMIData.map { $0.value }
+            let weightValues = visibleWeightData.map { $0.value }
+            
+            let bmiMin: Double = bmiValues.min() ?? 18
+            let bmiMax: Double = bmiValues.max() ?? 35
+            let weightMin = weightValues.min() ?? 0
+            let weightMax = weightValues.max() ?? 1
+            
+            normalization = (min: bmiMin, max: bmiMax, weightMin: weightMin, weightMax: weightMax)
+            cachedBMINormalization = normalization
+        }
         
         // Avoid division by zero
-        guard bmiMax > bmiMin, weightMax > weightMin else {
+        guard normalization.max > normalization.min, normalization.weightMax > normalization.weightMin else {
             visibleBMIPoints = []
+            os_signpost(.end, log: perfLog, name: "updateVisibleData", signpostID: signpostID)
             return
         }
         
-        let bmiRange = bmiMax - bmiMin
-        let weightRange = weightMax - weightMin
+        let bmiRange = normalization.max - normalization.min
+        let weightRange = normalization.weightMax - normalization.weightMin
         
-        visibleBMIPoints = model.bmiBins.compactMap { bin in
-            guard bin.value >= bmiMin && bin.value <= bmiMax else { return nil }
+        // Only process windowed BMI data
+        let windowedBMIData = getWindowedData(from: model.bmiBins)
+        visibleBMIPoints = windowedBMIData.compactMap { bin in
+            guard bin.value >= normalization.min && bin.value <= normalization.max else { return nil }
             
-            let normalizedValue = weightMin + (bin.value - bmiMin) * weightRange / bmiRange
-            guard normalizedValue >= weightMin && normalizedValue <= weightMax else { return nil }
+            let normalizedValue = normalization.weightMin + (bin.value - normalization.min) * weightRange / bmiRange
+            guard normalizedValue >= normalization.weightMin && normalizedValue <= normalization.weightMax else { return nil }
             
             return Bin(date: bin.date, value: normalizedValue)
         }
+        
+        os_signpost(.end, log: perfLog, name: "updateVisibleData", signpostID: signpostID)
     }
 
     private func label(for span: Span) -> String {
@@ -424,9 +498,29 @@ struct WeightChart<Model: WeightGraphModeling>: View {
     }
     
     private func updateVisibleDataAfterScroll() {
+        // Clear cache to force recalculation with new scroll position
+        cachedWeightDomain = nil
+        cachedBMINormalization = nil
+        
         // Post-scroll Y-domain and BMI normalization updates
         DispatchQueue.main.async {
-            self.updateVisibleData()
+            self.updateVisibleDataOptimized()
+        }
+    }
+    
+    /// Progressive data loading for real-time scroll updates
+    private func updateVisibleDataProgressively() {
+        // Only update if we're not in a rapid scroll gesture
+        guard !isScrolling else { return }
+        
+        // Debounce rapid scroll position changes
+        lastUpdateTimestamp = Date()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { // Very short debounce for responsiveness
+            if Date().timeIntervalSince(self.lastUpdateTimestamp) >= 0.015 {
+                // Only clear domain cache, keep BMI normalization cache for speed
+                self.cachedWeightDomain = nil
+                self.updateVisibleDataOptimized()
+            }
         }
     }
 
@@ -468,6 +562,107 @@ struct WeightChart<Model: WeightGraphModeling>: View {
             formatter.dateFormat = "MMM yyyy"
         }
         return formatter.string(from: date)
+    }
+    
+    // MARK: - Performance Optimization Methods
+    
+    /// Returns windowed data with progressive loading for smooth scrolling
+    private func getWindowedData(from allBins: [Bin]) -> [Bin] {
+        guard !allBins.isEmpty else { return [] }
+        
+        // For smaller datasets, use all data for best experience
+        let totalPoints = allBins.count
+        guard totalPoints > 1000 else { return allBins }
+        
+        guard let scrollPosition = currentScrollPosition else { 
+            // If no scroll position, return a reasonable amount from the end
+            let sortedBins = allBins.sorted { $0.date < $1.date }
+            let endIndex = sortedBins.count
+            let startIndex = max(0, endIndex - 1500) // Show last 1500 points
+            return Array(sortedBins[startIndex..<endIndex])
+        }
+        
+        // Use progressive loading strategy for smooth scrolling
+        return getProgressiveWindowData(from: allBins, around: scrollPosition)
+    }
+    
+    /// Progressive data loading strategy for smooth continuous scrolling
+    private func getProgressiveWindowData(from allBins: [Bin], around scrollPosition: Date) -> [Bin] {
+        let sortedBins = allBins.sorted { $0.date < $1.date }
+        
+        // Calculate adaptive window size based on span and total data
+        let baseWindowSize: TimeInterval
+        let bufferMultiplier: Double = 4.0 // Larger buffer for smooth scrolling
+        
+        switch model.span {
+        case .week:
+            baseWindowSize = 7 * 24 * 60 * 60 * bufferMultiplier // 4 weeks total
+        case .month:
+            baseWindowSize = 30 * 24 * 60 * 60 * bufferMultiplier // 4 months total  
+        case .year:
+            baseWindowSize = 365 * 24 * 60 * 60 * bufferMultiplier // 4 years total
+        }
+        
+        // Find center point in the data
+        let centerIndex = sortedBins.firstIndex { $0.date >= scrollPosition } ?? sortedBins.count / 2
+        
+        // Calculate dynamic range based on data density
+        let averageDataDensity = calculateDataDensity(sortedBins, around: centerIndex)
+        let adaptivePointCount = min(2000, max(500, Int(baseWindowSize / averageDataDensity)))
+        
+        // Create overlapping windows for smooth transitions
+        let halfRange = adaptivePointCount / 2
+        let startIndex = max(0, centerIndex - halfRange)
+        let endIndex = min(sortedBins.count, centerIndex + halfRange)
+        
+        let windowedData = Array(sortedBins[startIndex..<endIndex])
+        
+        os_log("Progressive window: center=%d, range=%d-%d, points=%d, density=%.2f", 
+               log: perfLog, type: .debug, centerIndex, startIndex, endIndex, windowedData.count, averageDataDensity)
+        
+        return windowedData
+    }
+    
+    /// Calculate average time interval between data points for adaptive windowing
+    private func calculateDataDensity(_ sortedBins: [Bin], around centerIndex: Int) -> TimeInterval {
+        guard sortedBins.count > 1 else { return 86400 } // Default to 1 day
+        
+        // Sample a small range around the center to calculate density
+        let sampleStart = max(0, centerIndex - 50)
+        let sampleEnd = min(sortedBins.count - 1, centerIndex + 50)
+        
+        guard sampleEnd > sampleStart else { return 86400 }
+        
+        let timeSpan = sortedBins[sampleEnd].date.timeIntervalSince(sortedBins[sampleStart].date)
+        let pointCount = Double(sampleEnd - sampleStart)
+        
+        return timeSpan / pointCount
+    }
+    
+    /// Cached Y domain calculation for better performance
+    private func getOptimizedYDomain() -> ClosedRange<Double> {
+        if let cached = cachedWeightDomain {
+            return cached
+        }
+        
+        // Use windowed data for domain calculation
+        let windowedData = getWindowedData(from: model.bins)
+        let weightValues = windowedData.map { $0.value }
+        
+        guard !weightValues.isEmpty else {
+            let defaultDomain = 0.0...1.0
+            cachedWeightDomain = defaultDomain
+            return defaultDomain
+        }
+        
+        let minY = weightValues.min() ?? 0
+        let maxY = weightValues.max() ?? 1
+        let yPadding = (maxY - minY) * 0.1
+        let yDomain = (minY - yPadding)...(maxY + yPadding)
+        
+        // Cache the result
+        cachedWeightDomain = yDomain
+        return yDomain
     }
 }
 
@@ -527,6 +722,7 @@ struct WeightChart<Model: WeightGraphModeling>: View {
             }.sorted { $0.date < $1.date }
         }
     }
+    
     let store = WeightStore(provider: PreviewProviderStore())
     let model = WeightGraphModel(store: store)
     return WeightChart(model: model)
